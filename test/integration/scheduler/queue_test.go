@@ -44,6 +44,8 @@ import (
 	"k8s.io/kubernetes/pkg/scheduler"
 	configtesting "k8s.io/kubernetes/pkg/scheduler/apis/config/testing"
 	"k8s.io/kubernetes/pkg/scheduler/framework"
+	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/defaultbinder"
+	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/names"
 	frameworkruntime "k8s.io/kubernetes/pkg/scheduler/framework/runtime"
 	st "k8s.io/kubernetes/pkg/scheduler/testing"
 	testfwk "k8s.io/kubernetes/test/integration/framework"
@@ -145,7 +147,7 @@ func TestSchedulingGates(t *testing.T) {
 
 			// Pop the expected pods out. They should be de-queueable.
 			for _, wantPod := range tt.want {
-				podInfo := nextPodOrDie(t, testCtx)
+				podInfo := testutils.NextPodOrDie(t, testCtx)
 				if got := podInfo.Pod.Name; got != wantPod {
 					t.Errorf("Want %v to be popped out, but got %v", wantPod, got)
 				}
@@ -164,7 +166,7 @@ func TestSchedulingGates(t *testing.T) {
 			}
 			// Pop the expected pods out. They should be de-queueable.
 			for _, wantPod := range tt.wantPostGatesRemoval {
-				podInfo := nextPodOrDie(t, testCtx)
+				podInfo := testutils.NextPodOrDie(t, testCtx)
 				if got := podInfo.Pod.Name; got != wantPod {
 					t.Errorf("Want %v to be popped out, but got %v", wantPod, got)
 				}
@@ -222,7 +224,7 @@ func TestCoreResourceEnqueue(t *testing.T) {
 
 	// Pop the three pods out. They should be unschedulable.
 	for i := 0; i < 3; i++ {
-		podInfo := nextPodOrDie(t, testCtx)
+		podInfo := testutils.NextPodOrDie(t, testCtx)
 		fwk, ok := testCtx.Scheduler.Profiles[podInfo.Pod.Spec.SchedulerName]
 		if !ok {
 			t.Fatalf("Cannot find the profile for Pod %v", podInfo.Pod.Name)
@@ -243,7 +245,7 @@ func TestCoreResourceEnqueue(t *testing.T) {
 	}
 
 	// Now we should be able to pop the Pod from activeQ again.
-	podInfo := nextPodOrDie(t, testCtx)
+	podInfo := testutils.NextPodOrDie(t, testCtx)
 	if podInfo.Attempts != 2 {
 		t.Fatalf("Expected the Pod to be attempted 2 times, but got %v", podInfo.Attempts)
 	}
@@ -255,7 +257,7 @@ func TestCoreResourceEnqueue(t *testing.T) {
 	// - Although the failure reason has been lifted, Pod2 still won't be moved to active due to
 	//   the node event's preCheckForNode().
 	// - Regarding Pod3, the NodeTaintChange event is irrelevant with its scheduling failure.
-	podInfo = nextPod(t, testCtx)
+	podInfo = testutils.NextPod(t, testCtx)
 	if podInfo != nil {
 		t.Fatalf("Unexpected pod %v get popped out", podInfo.Pod.Name)
 	}
@@ -276,9 +278,9 @@ func (f *fakeCRPlugin) Filter(_ context.Context, _ *framework.CycleState, _ *v1.
 
 // EventsToRegister returns the possible events that may make a Pod
 // failed by this plugin schedulable.
-func (f *fakeCRPlugin) EventsToRegister() []framework.ClusterEvent {
-	return []framework.ClusterEvent{
-		{Resource: "foos.v1.example.com", ActionType: framework.All},
+func (f *fakeCRPlugin) EventsToRegister() []framework.ClusterEventWithHint {
+	return []framework.ClusterEventWithHint{
+		{Event: framework.ClusterEvent{Resource: "foos.v1.example.com", ActionType: framework.All}},
 	}
 }
 
@@ -402,7 +404,7 @@ func TestCustomResourceEnqueue(t *testing.T) {
 	}
 
 	// Pop fake-pod out. It should be unschedulable.
-	podInfo := nextPodOrDie(t, testCtx)
+	podInfo := testutils.NextPodOrDie(t, testCtx)
 	fwk, ok := testCtx.Scheduler.Profiles[podInfo.Pod.Spec.SchedulerName]
 	if !ok {
 		t.Fatalf("Cannot find the profile for Pod %v", podInfo.Pod.Name)
@@ -434,8 +436,99 @@ func TestCustomResourceEnqueue(t *testing.T) {
 	}
 
 	// Now we should be able to pop the Pod from activeQ again.
-	podInfo = nextPodOrDie(t, testCtx)
+	podInfo = testutils.NextPodOrDie(t, testCtx)
 	if podInfo.Attempts != 2 {
 		t.Errorf("Expected the Pod to be attempted 2 times, but got %v", podInfo.Attempts)
 	}
+}
+
+// TestRequeueByBindFailure verify Pods failed by bind plugin are
+// put back to the queue regardless of whether event happens or not.
+func TestRequeueByBindFailure(t *testing.T) {
+	registry := frameworkruntime.Registry{
+		"firstFailBindPlugin": newFirstFailBindPlugin,
+	}
+	cfg := configtesting.V1ToInternalWithDefaults(t, configv1.KubeSchedulerConfiguration{
+		Profiles: []configv1.KubeSchedulerProfile{{
+			SchedulerName: pointer.String(v1.DefaultSchedulerName),
+			Plugins: &configv1.Plugins{
+				MultiPoint: configv1.PluginSet{
+					Enabled: []configv1.Plugin{
+						{Name: "firstFailBindPlugin"},
+					},
+					Disabled: []configv1.Plugin{
+						{Name: names.DefaultBinder},
+					},
+				},
+			},
+		}}})
+
+	// Use zero backoff seconds to bypass backoffQ.
+	testCtx := testutils.InitTestSchedulerWithOptions(
+		t,
+		testutils.InitTestAPIServer(t, "core-res-enqueue", nil),
+		0,
+		scheduler.WithPodInitialBackoffSeconds(0),
+		scheduler.WithPodMaxBackoffSeconds(0),
+		scheduler.WithProfiles(cfg.Profiles...),
+		scheduler.WithFrameworkOutOfTreeRegistry(registry),
+	)
+	testutils.SyncSchedulerInformerFactory(testCtx)
+
+	go testCtx.Scheduler.Run(testCtx.Ctx)
+
+	cs, ns, ctx := testCtx.ClientSet, testCtx.NS.Name, testCtx.Ctx
+	node := st.MakeNode().Name("fake-node").Obj()
+	if _, err := cs.CoreV1().Nodes().Create(ctx, node, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("Failed to create Node %q: %v", node.Name, err)
+	}
+	// create a pod.
+	pod := st.MakePod().Namespace(ns).Name("pod-1").Container(imageutils.GetPauseImageName()).Obj()
+	if _, err := cs.CoreV1().Pods(ns).Create(ctx, pod, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("Failed to create Pod %q: %v", pod.Name, err)
+	}
+
+	// first binding try should fail.
+	err := wait.Poll(200*time.Millisecond, wait.ForeverTestTimeout, testutils.PodSchedulingError(cs, ns, "pod-1"))
+	if err != nil {
+		t.Fatalf("Expect pod-1 to be rejected by the bind plugin")
+	}
+
+	// The pod should be enqueued to activeQ/backoffQ without any event.
+	// The pod should be scheduled in the second binding try.
+	err = wait.Poll(200*time.Millisecond, wait.ForeverTestTimeout, testutils.PodScheduled(cs, ns, "pod-1"))
+	if err != nil {
+		t.Fatalf("Expect pod-1 to be scheduled by the bind plugin in the second binding try")
+	}
+}
+
+// firstFailBindPlugin rejects the Pod in the first Bind call.
+type firstFailBindPlugin struct {
+	counter             int
+	defaultBinderPlugin framework.BindPlugin
+}
+
+func newFirstFailBindPlugin(_ runtime.Object, handle framework.Handle) (framework.Plugin, error) {
+	binder, err := defaultbinder.New(nil, handle)
+	if err != nil {
+		return nil, err
+	}
+
+	return &firstFailBindPlugin{
+		defaultBinderPlugin: binder.(framework.BindPlugin),
+	}, nil
+}
+
+func (*firstFailBindPlugin) Name() string {
+	return "firstFailBindPlugin"
+}
+
+func (p *firstFailBindPlugin) Bind(ctx context.Context, state *framework.CycleState, pod *v1.Pod, nodename string) *framework.Status {
+	if p.counter == 0 {
+		// fail in the first Bind call.
+		p.counter++
+		return framework.NewStatus(framework.Error, "firstFailBindPlugin rejects the Pod")
+	}
+
+	return p.defaultBinderPlugin.Bind(ctx, state, pod, nodename)
 }

@@ -27,6 +27,7 @@ import (
 	"strings"
 	"time"
 
+	"k8s.io/kubernetes/pkg/features"
 	utilnode "k8s.io/kubernetes/pkg/util/node"
 
 	"github.com/fsnotify/fsnotify"
@@ -41,7 +42,9 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/serializer"
 	"k8s.io/apimachinery/pkg/selection"
 	"k8s.io/apimachinery/pkg/types"
+	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/apimachinery/pkg/util/validation/field"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/apiserver/pkg/server/healthz"
 	"k8s.io/apiserver/pkg/server/mux"
@@ -88,7 +91,7 @@ import (
 
 func init() {
 	utilruntime.Must(metricsfeatures.AddFeatureGates(utilfeature.DefaultMutableFeatureGate))
-	logsapi.AddFeatureGates(utilfeature.DefaultMutableFeatureGate)
+	utilruntime.Must(logsapi.AddFeatureGates(utilfeature.DefaultMutableFeatureGate))
 }
 
 // proxyRun defines the interface to run a specified ProxyServer
@@ -206,6 +209,7 @@ func (o *Options) AddFlags(fs *pflag.FlagSet) {
 	fs.Var(&o.config.DetectLocalMode, "detect-local-mode", "Mode to use to detect local traffic. This parameter is ignored if a config file is specified by --config.")
 	fs.StringVar(&o.config.DetectLocal.BridgeInterface, "pod-bridge-interface", o.config.DetectLocal.BridgeInterface, "A bridge interface name in the cluster. Kube-proxy considers traffic as local if originating from an interface which matches the value. This argument should be set if DetectLocalMode is set to BridgeInterface.")
 	fs.StringVar(&o.config.DetectLocal.InterfaceNamePrefix, "pod-interface-name-prefix", o.config.DetectLocal.InterfaceNamePrefix, "An interface prefix in the cluster. Kube-proxy considers traffic as local if originating from interfaces that match the given prefix. This argument should be set if DetectLocalMode is set to InterfaceNamePrefix.")
+	logsapi.AddFlags(&o.config.Logging, fs)
 }
 
 // newKubeProxyConfiguration returns a KubeProxyConfiguration with default values
@@ -231,7 +235,7 @@ func NewOptions() *Options {
 }
 
 // Complete completes all the required options.
-func (o *Options) Complete() error {
+func (o *Options) Complete(fs *pflag.FlagSet) error {
 	if len(o.ConfigFile) == 0 && len(o.WriteConfigTo) == 0 {
 		o.config.HealthzBindAddress = addressFromDeprecatedFlags(o.config.HealthzBindAddress, o.healthzPort)
 		o.config.MetricsBindAddress = addressFromDeprecatedFlags(o.config.MetricsBindAddress, o.metricsPort)
@@ -243,6 +247,14 @@ func (o *Options) Complete() error {
 		if err != nil {
 			return err
 		}
+
+		// Before we overwrite the config which holds the parsed
+		// command line parameters, we need to copy all modified
+		// logging settings over to the loaded config (i.e.  logging
+		// command line flags have priority). Otherwise `--config
+		// ... -v=5` doesn't work (config resets verbosity even
+		// when it contains no logging settings).
+		copyLogsFromFlags(fs, &c.Logging)
 		o.config = c
 
 		if err := o.initWatcher(); err != nil {
@@ -257,6 +269,39 @@ func (o *Options) Complete() error {
 	}
 
 	return utilfeature.DefaultMutableFeatureGate.SetFromMap(o.config.FeatureGates)
+}
+
+// copyLogsFromFlags applies the logging flags from the given flag set to the given
+// configuration. Fields for which the corresponding flag was not used are left
+// unmodified. For fields that have multiple values (like vmodule), the values from
+// the flags get joined so that the command line flags have priority.
+//
+// TODO (pohly): move this to logsapi
+func copyLogsFromFlags(from *pflag.FlagSet, to *logsapi.LoggingConfiguration) error {
+	var cloneFS pflag.FlagSet
+	logsapi.AddFlags(to, &cloneFS)
+	vmodule := to.VModule
+	to.VModule = nil
+	var err error
+	cloneFS.VisitAll(func(f *pflag.Flag) {
+		if err != nil {
+			return
+		}
+		fsFlag := from.Lookup(f.Name)
+		if fsFlag == nil {
+			err = fmt.Errorf("logging flag %s not found in flag set", f.Name)
+			return
+		}
+		if !fsFlag.Changed {
+			return
+		}
+		if setErr := f.Value.Set(fsFlag.Value.String()); setErr != nil {
+			err = fmt.Errorf("copying flag %s value: %v", f.Name, setErr)
+			return
+		}
+	})
+	to.VModule = append(to.VModule, vmodule...)
+	return err
 }
 
 // Creates a new filesystem watcher and adds watches for the config file.
@@ -467,15 +512,21 @@ addon that provides cluster DNS for these cluster IPs. The user must create a se
 with the apiserver API to configure the proxy.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			verflag.PrintAndExitIfRequested()
-			cliflag.PrintFlags(cmd.Flags())
 
 			if err := initForOS(opts.WindowsService); err != nil {
 				return fmt.Errorf("failed os init: %w", err)
 			}
 
-			if err := opts.Complete(); err != nil {
+			if err := opts.Complete(cmd.Flags()); err != nil {
 				return fmt.Errorf("failed complete: %w", err)
 			}
+
+			logs.InitLogs()
+			if err := logsapi.ValidateAndApplyAsField(&opts.config.Logging, utilfeature.DefaultFeatureGate, field.NewPath("logging")); err != nil {
+				return fmt.Errorf("initialize logging: %v", err)
+			}
+
+			cliflag.PrintFlags(cmd.Flags())
 
 			if err := opts.Validate(); err != nil {
 				return fmt.Errorf("failed validate: %w", err)
@@ -567,12 +618,129 @@ func newProxyServer(config *kubeproxyconfig.KubeProxyConfiguration, master strin
 		s.HealthzServer = healthcheck.NewProxierHealthServer(config.HealthzBindAddress, 2*config.IPTables.SyncPeriod.Duration, s.Recorder, s.NodeRef)
 	}
 
-	s.Proxier, err = s.createProxier(config)
+	err = s.platformSetup()
+	if err != nil {
+		return nil, err
+	}
+
+	ipv4Supported, ipv6Supported, dualStackSupported, err := s.platformCheckSupported()
+	if err != nil {
+		return nil, err
+	} else if (s.PrimaryIPFamily == v1.IPv4Protocol && !ipv4Supported) || (s.PrimaryIPFamily == v1.IPv6Protocol && !ipv6Supported) {
+		return nil, fmt.Errorf("no support for primary IP family %q", s.PrimaryIPFamily)
+	} else if dualStackSupported {
+		klog.InfoS("kube-proxy running in dual-stack mode", "primary ipFamily", s.PrimaryIPFamily)
+	} else {
+		klog.InfoS("kube-proxy running in single-stack mode", "ipFamily", s.PrimaryIPFamily)
+	}
+
+	err, fatal := checkIPConfig(s, dualStackSupported)
+	if err != nil {
+		if fatal {
+			return nil, fmt.Errorf("kube-proxy configuration is incorrect: %v", err)
+		}
+		klog.ErrorS(err, "Kube-proxy configuration may be incomplete or incorrect")
+	}
+
+	s.Proxier, err = s.createProxier(config, dualStackSupported)
 	if err != nil {
 		return nil, err
 	}
 
 	return s, nil
+}
+
+// checkIPConfig confirms that s has proper configuration for its primary IP family.
+func checkIPConfig(s *ProxyServer, dualStackSupported bool) (error, bool) {
+	var errors []error
+	var badFamily netutils.IPFamily
+
+	if s.PrimaryIPFamily == v1.IPv4Protocol {
+		badFamily = netutils.IPv6
+	} else {
+		badFamily = netutils.IPv4
+	}
+
+	var clusterType string
+	if dualStackSupported {
+		clusterType = fmt.Sprintf("%s-primary", s.PrimaryIPFamily)
+	} else {
+		clusterType = fmt.Sprintf("%s-only", s.PrimaryIPFamily)
+	}
+
+	// Historically, we did not check most of the config options, so we cannot
+	// retroactively make IP family mismatches in those options be fatal. When we add
+	// new options to check here, we should make problems with those options be fatal.
+	fatal := false
+
+	if s.Config.ClusterCIDR != "" {
+		clusterCIDRs := strings.Split(s.Config.ClusterCIDR, ",")
+		if badCIDRs(clusterCIDRs, badFamily) {
+			errors = append(errors, fmt.Errorf("cluster is %s but clusterCIDRs contains only IPv%s addresses", clusterType, badFamily))
+			if s.Config.DetectLocalMode == kubeproxyconfig.LocalModeClusterCIDR {
+				// This has always been a fatal error
+				fatal = true
+			}
+		}
+	}
+
+	if badCIDRs(s.Config.NodePortAddresses, badFamily) {
+		errors = append(errors, fmt.Errorf("cluster is %s but nodePortAddresses contains only IPv%s addresses", clusterType, badFamily))
+	}
+
+	if badCIDRs(s.podCIDRs, badFamily) {
+		errors = append(errors, fmt.Errorf("cluster is %s but node.spec.podCIDRs contains only IPv%s addresses", clusterType, badFamily))
+		if s.Config.DetectLocalMode == kubeproxyconfig.LocalModeNodeCIDR {
+			// This has always been a fatal error
+			fatal = true
+		}
+	}
+
+	if netutils.IPFamilyOfString(s.Config.Winkernel.SourceVip) == badFamily {
+		errors = append(errors, fmt.Errorf("cluster is %s but winkernel.sourceVip is IPv%s", clusterType, badFamily))
+	}
+
+	// In some cases, wrong-IP-family is only a problem when the secondary IP family
+	// isn't present at all.
+	if !dualStackSupported {
+		if badCIDRs(s.Config.IPVS.ExcludeCIDRs, badFamily) {
+			errors = append(errors, fmt.Errorf("cluster is %s but ipvs.excludeCIDRs contains only IPv%s addresses", clusterType, badFamily))
+		}
+
+		if badBindAddress(s.Config.HealthzBindAddress, badFamily) {
+			errors = append(errors, fmt.Errorf("cluster is %s but healthzBindAddress is IPv%s", clusterType, badFamily))
+		}
+		if badBindAddress(s.Config.MetricsBindAddress, badFamily) {
+			errors = append(errors, fmt.Errorf("cluster is %s but metricsBindAddress is IPv%s", clusterType, badFamily))
+		}
+	}
+
+	return utilerrors.NewAggregate(errors), fatal
+}
+
+// badCIDRs returns true if cidrs is a non-empty list of CIDRs, all of wrongFamily.
+func badCIDRs(cidrs []string, wrongFamily netutils.IPFamily) bool {
+	if len(cidrs) == 0 {
+		return false
+	}
+	for _, cidr := range cidrs {
+		if netutils.IPFamilyOfCIDRString(cidr) != wrongFamily {
+			return false
+		}
+	}
+	return true
+}
+
+// badBindAddress returns true if bindAddress is an "IP:port" string where IP is a
+// non-zero IP of wrongFamily.
+func badBindAddress(bindAddress string, wrongFamily netutils.IPFamily) bool {
+	if host, _, _ := net.SplitHostPort(bindAddress); host != "" {
+		ip := netutils.ParseIPSloppy(host)
+		if ip != nil && netutils.IPFamilyOf(ip) == wrongFamily && !ip.IsUnspecified() {
+			return true
+		}
+	}
+	return false
 }
 
 // createClient creates a kube client from the given config and masterOverride.
@@ -706,12 +874,6 @@ func (s *ProxyServer) Run() error {
 	// Start up a metrics server if requested
 	serveMetrics(s.Config.MetricsBindAddress, s.Config.Mode, s.Config.EnableProfiling, errCh)
 
-	// Do platform-specific setup
-	err := s.platformSetup()
-	if err != nil {
-		return err
-	}
-
 	noProxyName, err := labels.NewRequirement(apis.LabelServiceProxyName, selection.DoesNotExist, nil)
 	if err != nil {
 		return err
@@ -756,6 +918,11 @@ func (s *ProxyServer) Run() error {
 	// https://issues.k8s.io/111321
 	if s.Config.DetectLocalMode == kubeproxyconfig.LocalModeNodeCIDR {
 		nodeConfig.RegisterEventHandler(proxy.NewNodePodCIDRHandler(s.podCIDRs))
+	}
+	if utilfeature.DefaultFeatureGate.Enabled(features.KubeProxyDrainingTerminatingNodes) {
+		nodeConfig.RegisterEventHandler(&proxy.NodeEligibleHandler{
+			HealthServer: s.HealthzServer,
+		})
 	}
 	nodeConfig.RegisterEventHandler(s.Proxier)
 

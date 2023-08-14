@@ -353,8 +353,10 @@ const defaultResourceClaimControllerWorkers = 10
 
 func startResourceClaimController(ctx context.Context, controllerContext ControllerContext) (controller.Interface, bool, error) {
 	ephemeralController, err := resourceclaim.NewController(
+		klog.FromContext(ctx),
 		controllerContext.ClientBuilder.ClientOrDie("resource-claim-controller"),
 		controllerContext.InformerFactory.Core().V1().Pods(),
+		controllerContext.InformerFactory.Resource().V1alpha2().PodSchedulingContexts(),
 		controllerContext.InformerFactory.Resource().V1alpha2().ResourceClaims(),
 		controllerContext.InformerFactory.Resource().V1alpha2().ResourceClaimTemplates())
 	if err != nil {
@@ -377,6 +379,7 @@ func startEndpointController(ctx context.Context, controllerCtx ControllerContex
 
 func startReplicationController(ctx context.Context, controllerContext ControllerContext) (controller.Interface, bool, error) {
 	go replicationcontroller.NewReplicationManager(
+		klog.FromContext(ctx),
 		controllerContext.InformerFactory.Core().V1().Pods(),
 		controllerContext.InformerFactory.Core().V1().ReplicationControllers(),
 		controllerContext.ClientBuilder.ClientOrDie("replication-controller"),
